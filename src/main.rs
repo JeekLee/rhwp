@@ -1453,6 +1453,17 @@ fn restructure_nested_tables(markdown: &str, cfg: &LlmConfig) -> String {
     result
 }
 
+fn remove_page_numbers(md: &str) -> String {
+    md.lines()
+        .filter(|line| {
+            let t = line.trim();
+            // -N-, - N -, ─N─ 등 페이지 번호 패턴 제거
+            !(t.starts_with('-') && t.ends_with('-') && t.trim_matches('-').trim().parse::<u32>().is_ok())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn export_markdown(args: &[String]) {
     if args.is_empty() {
         eprintln!("오류: HWP 파일 경로를 지정해주세요.");
@@ -1463,6 +1474,7 @@ fn export_markdown(args: &[String]) {
     let file_path = &args[0];
     let mut output_dir = "output".to_string();
     let mut target_page: Option<u32> = None;
+    let mut do_merge = false;
     let mut llm_url: Option<String> = None;
     let mut llm_api_key: Option<String> = None;
     let mut llm_model: Option<String> = None;
@@ -1499,6 +1511,10 @@ fn export_markdown(args: &[String]) {
                     eprintln!("오류: --page 뒤에 페이지 번호가 필요합니다.");
                     return;
                 }
+            }
+            "--merge" => {
+                do_merge = true;
+                i += 1;
             }
             "--llm-url" => {
                 if i + 1 < args.len() {
@@ -1661,6 +1677,7 @@ fn export_markdown(args: &[String]) {
     let assets_dir_name = format!("{}_assets", file_stem);
     let assets_dir_path = output_path.join(&assets_dir_name);
     let mut written_image_count: usize = 0;
+    let mut merged_pages: Vec<String> = Vec::new();
 
     let mime_to_ext = |mime: &str| -> &'static str {
         match mime {
@@ -1819,20 +1836,29 @@ fn export_markdown(args: &[String]) {
                     markdown = restructure_nested_tables(&markdown, cfg);
                 }
 
-                if !markdown.ends_with('\n') {
-                    markdown.push('\n');
-                }
+                markdown = remove_page_numbers(&markdown);
 
-                let md_filename = if page_count == 1 {
-                    format!("{}.md", file_stem)
+                let markdown = markdown.trim_end().to_string();
+
+                if do_merge {
+                    if !markdown.is_empty() {
+                        merged_pages.push(markdown);
+                    }
                 } else {
-                    format!("{}_{:03}.md", file_stem, page_num + 1)
-                };
-                let md_path = output_path.join(&md_filename);
-
-                match fs::write(&md_path, markdown.as_bytes()) {
-                    Ok(_) => println!("  → {}", md_path.display()),
-                    Err(e) => eprintln!("오류: Markdown 저장 실패 - {}: {}", md_path.display(), e),
+                    let mut out = markdown;
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    let md_filename = if page_count == 1 {
+                        format!("{}.md", file_stem)
+                    } else {
+                        format!("{}_{:03}.md", file_stem, page_num + 1)
+                    };
+                    let md_path = output_path.join(&md_filename);
+                    match fs::write(&md_path, out.as_bytes()) {
+                        Ok(_) => println!("  → {}", md_path.display()),
+                        Err(e) => eprintln!("오류: Markdown 저장 실패 - {}: {}", md_path.display(), e),
+                    }
                 }
             }
             Err(e) => {
@@ -1841,19 +1867,23 @@ fn export_markdown(args: &[String]) {
         }
     }
 
+    if do_merge {
+        let merged = merged_pages.join("\n\n");
+        let md_path = output_path.join(format!("{}.md", file_stem));
+        match fs::write(&md_path, merged.as_bytes()) {
+            Ok(_) => println!("  → {} ({}페이지 병합)", md_path.display(), merged_pages.len()),
+            Err(e) => eprintln!("오류: Markdown 저장 실패 - {}: {}", md_path.display(), e),
+        }
+    }
+
     if written_image_count > 0 {
         println!(
-            "Markdown 내보내기 완료: {}개 MD 파일, {}개 이미지 → {}/",
-            pages.len(),
+            "Markdown 내보내기 완료: {}개 이미지 → {}/",
             written_image_count,
             output_dir
         );
     } else {
-        println!(
-            "Markdown 내보내기 완료: {}개 MD 파일 → {}/",
-            pages.len(),
-            output_dir
-        );
+        println!("Markdown 내보내기 완료 → {}/", output_dir);
     }
 }
 
