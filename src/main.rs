@@ -1236,6 +1236,137 @@ fn export_text(args: &[String]) {
     );
 }
 
+struct S3Config {
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+    access_key: String,
+    secret_key: String,
+    region: String,
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(data))
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC key error");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn s3_put(cfg: &S3Config, key: &str, data: &[u8], content_type: &str) -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // 타임스탬프
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let dt = {
+        // YYYYMMDDTHHMMSSZ 형식 (간단 구현)
+        let s = secs;
+        let sec = s % 60;
+        let s = s / 60;
+        let min = s % 60;
+        let s = s / 60;
+        let hour = s % 24;
+        let mut days = s / 24;
+        let mut year = 1970u32;
+        loop {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            let dy = if leap { 366 } else { 365 };
+            if days < dy {
+                break;
+            }
+            days -= dy;
+            year += 1;
+        }
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let month_days: [u64; 12] = if leap {
+            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        } else {
+            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        };
+        let mut month = 1u32;
+        for &md in &month_days {
+            if days < md {
+                break;
+            }
+            days -= md;
+            month += 1;
+        }
+        let day = days + 1;
+        format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            year, month, day, hour, min, sec
+        )
+    };
+    let date = &dt[..8];
+
+    let host = cfg
+        .endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    let uri = format!("/{}/{}", cfg.bucket, key);
+    let payload_hash = sha256_hex(data);
+
+    // canonical headers (알파벳 순)
+    let canonical_headers = format!(
+        "content-type:{}\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+        content_type, host, payload_hash, dt
+    );
+    let signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date";
+
+    let canonical_request = format!(
+        "PUT\n{}\n\n{}\n{}\n{}",
+        uri, canonical_headers, signed_headers, payload_hash
+    );
+
+    let credential_scope = format!("{}/{}/s3/aws4_request", date, cfg.region);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        dt,
+        credential_scope,
+        sha256_hex(canonical_request.as_bytes())
+    );
+
+    let signing_key = {
+        let k1 = hmac_sha256(format!("AWS4{}", cfg.secret_key).as_bytes(), date.as_bytes());
+        let k2 = hmac_sha256(&k1, cfg.region.as_bytes());
+        let k3 = hmac_sha256(&k2, b"s3");
+        hmac_sha256(&k3, b"aws4_request")
+    };
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        cfg.access_key, credential_scope, signed_headers, signature
+    );
+
+    let url = format!(
+        "{}/{}/{}",
+        cfg.endpoint.trim_end_matches('/'),
+        cfg.bucket,
+        key
+    );
+
+    ureq::put(&url)
+        .set("Host", host)
+        .set("Content-Type", content_type)
+        .set("x-amz-date", &dt)
+        .set("x-amz-content-sha256", &payload_hash)
+        .set("Authorization", &authorization)
+        .send_bytes(data)
+        .map_err(|e| format!("S3 PUT 실패: {}", e))?;
+
+    Ok(format!("s3://{}/{}", cfg.bucket, key))
+}
+
 struct LlmConfig {
     url: String,
     api_key: String,
@@ -1335,6 +1466,12 @@ fn export_markdown(args: &[String]) {
     let mut llm_url: Option<String> = None;
     let mut llm_api_key: Option<String> = None;
     let mut llm_model: Option<String> = None;
+    let mut s3_endpoint: Option<String> = None;
+    let mut s3_bucket: Option<String> = None;
+    let mut s3_prefix: Option<String> = None;
+    let mut s3_access_key: Option<String> = None;
+    let mut s3_secret_key: Option<String> = None;
+    let mut s3_region = "us-east-1".to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -1390,12 +1527,78 @@ fn export_markdown(args: &[String]) {
                     return;
                 }
             }
+            "--s3-endpoint" => {
+                if i + 1 < args.len() {
+                    s3_endpoint = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("오류: --s3-endpoint 뒤에 URL이 필요합니다.");
+                    return;
+                }
+            }
+            "--s3-bucket" => {
+                if i + 1 < args.len() {
+                    s3_bucket = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("오류: --s3-bucket 뒤에 버킷명이 필요합니다.");
+                    return;
+                }
+            }
+            "--s3-prefix" => {
+                if i + 1 < args.len() {
+                    s3_prefix = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("오류: --s3-prefix 뒤에 경로가 필요합니다.");
+                    return;
+                }
+            }
+            "--s3-access-key" => {
+                if i + 1 < args.len() {
+                    s3_access_key = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("오류: --s3-access-key 뒤에 키가 필요합니다.");
+                    return;
+                }
+            }
+            "--s3-secret-key" => {
+                if i + 1 < args.len() {
+                    s3_secret_key = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("오류: --s3-secret-key 뒤에 키가 필요합니다.");
+                    return;
+                }
+            }
+            "--s3-region" => {
+                if i + 1 < args.len() {
+                    s3_region = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    eprintln!("오류: --s3-region 뒤에 리전이 필요합니다.");
+                    return;
+                }
+            }
             _ => {
                 eprintln!("알 수 없는 옵션: {}", args[i]);
                 i += 1;
             }
         }
     }
+
+    let s3_cfg = match (s3_endpoint, s3_bucket, s3_access_key, s3_secret_key) {
+        (Some(endpoint), Some(bucket), Some(access_key), Some(secret_key)) => Some(S3Config {
+            endpoint,
+            bucket,
+            prefix: s3_prefix.unwrap_or_default(),
+            access_key,
+            secret_key,
+            region: s3_region,
+        }),
+        _ => None,
+    };
 
     let llm_cfg = match (llm_url, llm_api_key, llm_model) {
         (Some(url), Some(api_key), Some(model)) => Some(LlmConfig { url, api_key, model }),
@@ -1559,18 +1762,6 @@ fn export_markdown(args: &[String]) {
                         (fb_mime, fb_data)
                     };
 
-                    if !assets_dir_path.exists() {
-                        if let Err(e) = fs::create_dir_all(&assets_dir_path) {
-                            eprintln!(
-                                "오류: 이미지 출력 폴더 생성 실패 - {}: {}",
-                                assets_dir_path.display(),
-                                e
-                            );
-                            markdown = markdown.replace(&token, "");
-                            continue;
-                        }
-                    }
-
                     let ext = mime_to_ext(&mime);
                     let image_filename = format!(
                         "{}_p{:03}_img{:03}.{}",
@@ -1579,22 +1770,49 @@ fn export_markdown(args: &[String]) {
                         img_idx + 1,
                         ext
                     );
-                    let image_path = assets_dir_path.join(&image_filename);
 
-                    if let Err(e) = fs::write(&image_path, &image_data) {
-                        eprintln!("경고: 이미지 저장 실패 - {}: {}", image_path.display(), e);
-                        markdown = markdown.replace(&token, "");
-                        continue;
-                    }
+                    let image_link = if let Some(ref s3) = s3_cfg {
+                        // S3/MinIO 업로드
+                        let key = if s3.prefix.is_empty() {
+                            image_filename.clone()
+                        } else {
+                            format!("{}/{}", s3.prefix.trim_end_matches('/'), image_filename)
+                        };
+                        match s3_put(s3, &key, &image_data, &mime) {
+                            Ok(s3_url) => {
+                                eprintln!("  이미지 업로드: {}", s3_url);
+                                written_image_count += 1;
+                                format!("![image {}]({})", img_idx + 1, s3_url)
+                            }
+                            Err(e) => {
+                                eprintln!("경고: S3 업로드 실패 - {}: {}", image_filename, e);
+                                String::new()
+                            }
+                        }
+                    } else {
+                        // 로컬 저장
+                        if !assets_dir_path.exists() {
+                            if let Err(e) = fs::create_dir_all(&assets_dir_path) {
+                                eprintln!(
+                                    "오류: 이미지 출력 폴더 생성 실패 - {}: {}",
+                                    assets_dir_path.display(),
+                                    e
+                                );
+                                markdown = markdown.replace(&token, "");
+                                continue;
+                            }
+                        }
+                        let image_path = assets_dir_path.join(&image_filename);
+                        if let Err(e) = fs::write(&image_path, &image_data) {
+                            eprintln!("경고: 이미지 저장 실패 - {}: {}", image_path.display(), e);
+                            markdown = markdown.replace(&token, "");
+                            continue;
+                        }
+                        written_image_count += 1;
+                        format!("![image {}]({}/{})", img_idx + 1, assets_dir_name, image_filename)
+                    };
 
-                    let image_link = format!(
-                        "![image {}]({}/{})",
-                        img_idx + 1,
-                        assets_dir_name,
-                        image_filename
-                    );
                     markdown = markdown.replace(&token, &image_link);
-                    written_image_count += 1;
                 }
 
                 if let Some(ref cfg) = llm_cfg {
