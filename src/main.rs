@@ -1236,6 +1236,92 @@ fn export_text(args: &[String]) {
     );
 }
 
+struct LlmConfig {
+    url: String,
+    api_key: String,
+    model: String,
+}
+
+fn llm_restructure_nested_table(content: &str, cfg: &LlmConfig) -> Result<String, String> {
+    let prompt = format!(
+        "아래는 한글 문서 표 셀 내부에 중첩된 표의 데이터입니다.\n\
+        데이터 형식: ';'는 행 구분, '|'는 같은 행 안의 셀 구분입니다.\n\
+        이 구조와 내용을 파악하여 사람이 읽기 가장 자연스러운 텍스트로 변환하세요.\n\
+        들여쓰기, 기호(-, ·, 번호 등)를 내용에 맞게 자유롭게 활용하세요.\n\n\
+        제약:\n\
+        - 줄 구분은 \" <br> \" 사용 (마크다운 표 셀 내부이므로 실제 줄바꿈 금지)\n\
+        - 마크다운 표(|) 문법 사용 금지\n\
+        - 변환된 내용만 출력, 설명 없이\n\n\
+        중첩 표 데이터:\n{}",
+        content
+    );
+
+    let body = serde_json::json!({
+        "model": cfg.model,
+        "temperature": 0.0,
+        "messages": [{"role": "user", "content": prompt}]
+    });
+
+    let endpoint = format!("{}/chat/completions", cfg.url.trim_end_matches('/'));
+    let response = ureq::post(&endpoint)
+        .set("Authorization", &format!("Bearer {}", cfg.api_key))
+        .set("Content-Type", "application/json")
+        .send_json(body)
+        .map_err(|e| format!("LLM 호출 실패: {}", e))?;
+
+    let json: serde_json::Value = response
+        .into_json()
+        .map_err(|e| format!("응답 파싱 실패: {}", e))?;
+
+    let text = json["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| "응답 content 없음".to_string())?
+        .trim()
+        .replace('|', "\\|")
+        .replace('\n', " <br> ")
+        .replace('\r', "");
+
+    Ok(text)
+}
+
+fn restructure_nested_tables(markdown: &str, cfg: &LlmConfig) -> String {
+    if !markdown.contains("[[NT:") {
+        return markdown.to_string();
+    }
+
+    let mut result = String::new();
+    let mut remaining = markdown;
+
+    while let Some(start) = remaining.find("[[NT:") {
+        result.push_str(&remaining[..start]);
+        let after_open = &remaining[start + 5..];
+        if let Some(end) = after_open.find("]]") {
+            let content = &after_open[..end];
+            match llm_restructure_nested_table(content, cfg) {
+                Ok(restructured) => {
+                    eprintln!(
+                        "  nested table 재구조화: {} chars → {} chars",
+                        content.len(),
+                        restructured.len()
+                    );
+                    result.push_str(&restructured);
+                }
+                Err(e) => {
+                    eprintln!("  nested table LLM 실패, flat text 유지: {}", e);
+                    result.push_str(content);
+                }
+            }
+            remaining = &after_open[end + 2..];
+        } else {
+            result.push_str(&remaining[start..]);
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
 fn export_markdown(args: &[String]) {
     if args.is_empty() {
         eprintln!("오류: HWP 파일 경로를 지정해주세요.");
@@ -1246,6 +1332,9 @@ fn export_markdown(args: &[String]) {
     let file_path = &args[0];
     let mut output_dir = "output".to_string();
     let mut target_page: Option<u32> = None;
+    let mut llm_url: Option<String> = None;
+    let mut llm_api_key: Option<String> = None;
+    let mut llm_model: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -1274,12 +1363,44 @@ fn export_markdown(args: &[String]) {
                     return;
                 }
             }
+            "--llm-url" => {
+                if i + 1 < args.len() {
+                    llm_url = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("오류: --llm-url 뒤에 URL이 필요합니다.");
+                    return;
+                }
+            }
+            "--llm-api-key" => {
+                if i + 1 < args.len() {
+                    llm_api_key = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("오류: --llm-api-key 뒤에 키가 필요합니다.");
+                    return;
+                }
+            }
+            "--llm-model" => {
+                if i + 1 < args.len() {
+                    llm_model = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("오류: --llm-model 뒤에 모델명이 필요합니다.");
+                    return;
+                }
+            }
             _ => {
                 eprintln!("알 수 없는 옵션: {}", args[i]);
                 i += 1;
             }
         }
     }
+
+    let llm_cfg = match (llm_url, llm_api_key, llm_model) {
+        (Some(url), Some(api_key), Some(model)) => Some(LlmConfig { url, api_key, model }),
+        _ => None,
+    };
 
     let data = match fs::read(file_path) {
         Ok(d) => d,
@@ -1474,6 +1595,10 @@ fn export_markdown(args: &[String]) {
                     );
                     markdown = markdown.replace(&token, &image_link);
                     written_image_count += 1;
+                }
+
+                if let Some(ref cfg) = llm_cfg {
+                    markdown = restructure_nested_tables(&markdown, cfg);
                 }
 
                 if !markdown.ends_with('\n') {

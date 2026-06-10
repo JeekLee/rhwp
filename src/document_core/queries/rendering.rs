@@ -3383,12 +3383,56 @@ impl DocumentCore {
                 .to_string()
         }
 
+        fn nested_table_flat_text(table: &crate::model::table::Table) -> String {
+            let rows = table.row_count as usize;
+            let cols = table.col_count as usize;
+            if rows == 0 || cols == 0 {
+                return String::new();
+            }
+            // 행×열 그리드로 조립
+            let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols]; rows];
+            for cell in &table.cells {
+                let r = cell.row as usize;
+                let c = cell.col as usize;
+                if r < rows && c < cols {
+                    let txt = table_cell_text(cell);
+                    if !txt.is_empty() {
+                        grid[r][c] = txt;
+                    }
+                }
+            }
+            // 행 단위로 직렬화: 행은 ';', 같은 행의 셀은 '|' 구분
+            let row_strs: Vec<String> = grid
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .filter(|c| !c.is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            if row_strs.is_empty() {
+                return String::new();
+            }
+            format!("[[NT:{}]]", row_strs.join(";"))
+        }
+
         fn table_cell_text(cell: &crate::model::table::Cell) -> String {
             let mut parts: Vec<String> = Vec::new();
             for para in &cell.paragraphs {
                 let txt = para.text.trim();
                 if !txt.is_empty() {
                     parts.push(markdown_escape_cell(txt));
+                }
+                for ctrl in &para.controls {
+                    if let crate::model::control::Control::Table(nested) = ctrl {
+                        let flat = nested_table_flat_text(nested);
+                        if !flat.is_empty() {
+                            parts.push(flat);
+                        }
+                    }
                 }
             }
             parts.join(" <br> ")
