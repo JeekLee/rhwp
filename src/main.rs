@@ -1779,6 +1779,40 @@ fn export_markdown(args: &[String]) {
                         (fb_mime, fb_data)
                     };
 
+                    // BMP/octet-stream → PNG 변환 (마크다운 렌더러는 BMP 미지원)
+                    let detected_mime: String = if mime == "application/octet-stream" {
+                        if image_data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+                            "image/png".to_string()
+                        } else if image_data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                            "image/jpeg".to_string()
+                        } else if image_data.starts_with(b"GIF8") {
+                            "image/gif".to_string()
+                        } else if image_data.starts_with(&[0x42, 0x4D]) {
+                            "image/bmp".to_string()
+                        } else {
+                            mime.clone()
+                        }
+                    } else {
+                        mime.clone()
+                    };
+                    let (mime, image_data): (String, Vec<u8>) = if detected_mime == "image/bmp" {
+                        use std::io::Cursor;
+                        let result = image::load(Cursor::new(&image_data), image::ImageFormat::Bmp)
+                            .ok()
+                            .and_then(|img| {
+                                let mut buf: Vec<u8> = Vec::new();
+                                img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+                                    .ok()
+                                    .map(|_| buf)
+                            });
+                        match result {
+                            Some(png) => ("image/png".to_string(), png),
+                            None => (detected_mime, image_data),
+                        }
+                    } else {
+                        (detected_mime, image_data)
+                    };
+
                     let ext = mime_to_ext(&mime);
                     let image_filename = format!(
                         "{}_p{:03}_img{:03}.{}",
