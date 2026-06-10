@@ -3324,6 +3324,9 @@ impl DocumentCore {
     /// - 이미지는 `[[RHWP_IMAGE:n]]` 토큰으로 출력되며,
     ///   반환 벡터에 같은 순서로 `(sec_idx, para_idx, control_idx, bin_data_id)`가 담긴다.
     ///   (sec/para/ctrl은 없을 수 있으며, 이 경우 bin_data_id로 추출한다)
+    ///
+    /// 페이지 단위가 아닌 문서 전체를 한 번에 추출하려면
+    /// [`DocumentCore::extract_document_markdown_with_images_native`] 를 사용하세요.
     pub fn extract_page_markdown_with_images_native(
         &self,
         page_num: u32,
@@ -3375,105 +3378,6 @@ impl DocumentCore {
             }
         }
 
-        fn markdown_escape_cell(s: &str) -> String {
-            s.replace('|', "\\|")
-                .replace('\r', "")
-                .replace('\n', " ")
-                .trim()
-                .to_string()
-        }
-
-        fn nested_table_flat_text(table: &crate::model::table::Table) -> String {
-            let rows = table.row_count as usize;
-            let cols = table.col_count as usize;
-            if rows == 0 || cols == 0 {
-                return String::new();
-            }
-            // 행×열 그리드로 조립
-            let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols]; rows];
-            for cell in &table.cells {
-                let r = cell.row as usize;
-                let c = cell.col as usize;
-                if r < rows && c < cols {
-                    let txt = table_cell_text(cell);
-                    if !txt.is_empty() {
-                        grid[r][c] = txt;
-                    }
-                }
-            }
-            // 행 단위로 직렬화: 행은 ';', 같은 행의 셀은 '|' 구분
-            let row_strs: Vec<String> = grid
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .filter(|c| !c.is_empty())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("|")
-                })
-                .filter(|s| !s.is_empty())
-                .collect();
-            if row_strs.is_empty() {
-                return String::new();
-            }
-            format!("[[NT:{}]]", row_strs.join(";"))
-        }
-
-        fn table_cell_text(cell: &crate::model::table::Cell) -> String {
-            let mut parts: Vec<String> = Vec::new();
-            for para in &cell.paragraphs {
-                let txt = para.text.trim();
-                if !txt.is_empty() {
-                    parts.push(markdown_escape_cell(txt));
-                }
-                for ctrl in &para.controls {
-                    if let crate::model::control::Control::Table(nested) = ctrl {
-                        let flat = nested_table_flat_text(nested);
-                        if !flat.is_empty() {
-                            parts.push(flat);
-                        }
-                    }
-                }
-            }
-            parts.join(" <br> ")
-        }
-
-        fn table_to_markdown(table: &crate::model::table::Table) -> String {
-            let rows = table.row_count as usize;
-            let cols = table.col_count as usize;
-            if rows == 0 || cols == 0 {
-                return String::new();
-            }
-
-            let mut grid = vec![vec![String::new(); cols]; rows];
-
-            for cell in &table.cells {
-                let r = cell.row as usize;
-                let c = cell.col as usize;
-                if r >= rows || c >= cols {
-                    continue;
-                }
-                grid[r][c] = table_cell_text(cell);
-            }
-
-            let make_row = |cells: &[String]| -> String { format!("| {} |", cells.join(" | ")) };
-
-            let header = make_row(&grid[0]);
-            let separator = format!(
-                "| {} |",
-                std::iter::repeat("---")
-                    .take(cols)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
-
-            let mut lines = vec![header, separator];
-            for row in grid.iter().skip(1) {
-                lines.push(make_row(row));
-            }
-            lines.join("\n")
-        }
-
         fn lookup_table<'a>(
             doc: &'a crate::model::document::Document,
             sec_idx: usize,
@@ -3515,11 +3419,11 @@ impl DocumentCore {
                         table_node.control_index,
                     ) {
                         if let Some(table) = lookup_table(doc, si, pi, ci) {
-                            let md = table_to_markdown(table);
+                            let md = md_table_to_markdown(table);
                             if !md.is_empty() {
                                 items.push(MarkdownItem::Table(md));
                             }
-                            // 표 텍스트는 table_to_markdown으로 처리하고,
+                            // 표 텍스트는 md_table_to_markdown으로 처리하고,
                             // 표 내부 Image 노드만 별도로 수집한다.
                             for child in &node.children {
                                 collect_images_only(child, items);
@@ -3600,9 +3504,159 @@ impl DocumentCore {
             .map(|(md, _)| md)
     }
 
+    /// 문서 전체를 페이지 경계 없이 한 번에 Markdown으로 추출한다.
+    ///
+    /// 페이지 render tree를 경유하지 않고 document model을 직접 순회하므로,
+    /// cross-page 표 중복 문제가 발생하지 않는다. `--merge` 모드에서 사용.
+    pub fn extract_document_markdown_with_images_native(
+        &self,
+    ) -> (
+        String,
+        Vec<(Option<usize>, Option<usize>, Option<usize>, u16)>,
+    ) {
+        let mut out = String::new();
+        let mut images: Vec<(Option<usize>, Option<usize>, Option<usize>, u16)> = Vec::new();
+
+        for (si, section) in self.document.sections.iter().enumerate() {
+            for (pi, para) in section.paragraphs.iter().enumerate() {
+                for (ci, ctrl) in para.controls.iter().enumerate() {
+                    match ctrl {
+                        crate::model::control::Control::Table(table) => {
+                            let md = md_table_to_markdown(table);
+                            if !md.is_empty() {
+                                if !out.is_empty() && !out.ends_with("\n\n") {
+                                    out.push('\n');
+                                }
+                                out.push_str(&md);
+                                out.push_str("\n\n");
+                            }
+                        }
+                        crate::model::control::Control::Picture(pic) => {
+                            let bin_data_id = pic.image_attr.bin_data_id;
+                            if bin_data_id != 0 {
+                                let image_idx = images.len() + 1;
+                                if !out.is_empty() && !out.ends_with("\n\n") {
+                                    out.push('\n');
+                                }
+                                out.push_str(&format!("[[RHWP_IMAGE:{}]]\n\n", image_idx));
+                                images.push((Some(si), Some(pi), Some(ci), bin_data_id));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // U+001F 이하 제어 문자(객체 플레이스홀더 포함)를 제거한 순수 텍스트
+                let text: String = para.text.chars().filter(|c| *c > '\u{001F}').collect();
+                let text = text.trim();
+                if !text.is_empty() {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+            }
+        }
+
+        (out.trim_end().to_string(), images)
+    }
+
     // =====================================================================
     // 클립보드 API (내부)
     // =====================================================================
+}
+
+/// Markdown 표 셀 텍스트를 이스케이프한다.
+pub(crate) fn md_markdown_escape_cell(s: &str) -> String {
+    s.replace('|', "\\|")
+        .replace('\r', "")
+        .replace('\n', " ")
+        .trim()
+        .to_string()
+}
+
+/// 중첩 표를 `[[NT:row1c1|c2;row2c1|c2]]` 마커로 직렬화한다.
+pub(crate) fn md_nested_table_flat_text(table: &crate::model::table::Table) -> String {
+    let rows = table.row_count as usize;
+    let cols = table.col_count as usize;
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+    let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols]; rows];
+    for cell in &table.cells {
+        let r = cell.row as usize;
+        let c = cell.col as usize;
+        if r < rows && c < cols {
+            let txt = md_table_cell_text(cell);
+            if !txt.is_empty() {
+                grid[r][c] = txt;
+            }
+        }
+    }
+    let row_strs: Vec<String> = grid
+        .iter()
+        .map(|row| {
+            row.iter()
+                .filter(|c| !c.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    if row_strs.is_empty() {
+        return String::new();
+    }
+    format!("[[NT:{}]]", row_strs.join(";"))
+}
+
+/// 표 셀의 텍스트를 추출한다 (중첩 표 포함).
+pub(crate) fn md_table_cell_text(cell: &crate::model::table::Cell) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for para in &cell.paragraphs {
+        let txt = para.text.trim();
+        if !txt.is_empty() {
+            parts.push(md_markdown_escape_cell(txt));
+        }
+        for ctrl in &para.controls {
+            if let crate::model::control::Control::Table(nested) = ctrl {
+                let flat = md_nested_table_flat_text(nested);
+                if !flat.is_empty() {
+                    parts.push(flat);
+                }
+            }
+        }
+    }
+    parts.join(" <br> ")
+}
+
+/// 표를 Markdown table 문자열로 변환한다.
+pub(crate) fn md_table_to_markdown(table: &crate::model::table::Table) -> String {
+    let rows = table.row_count as usize;
+    let cols = table.col_count as usize;
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+    let mut grid = vec![vec![String::new(); cols]; rows];
+    for cell in &table.cells {
+        let r = cell.row as usize;
+        let c = cell.col as usize;
+        if r >= rows || c >= cols {
+            continue;
+        }
+        grid[r][c] = md_table_cell_text(cell);
+    }
+    let make_row = |cells: &[String]| -> String { format!("| {} |", cells.join(" | ")) };
+    let header = make_row(&grid[0]);
+    let separator = format!(
+        "| {} |",
+        std::iter::repeat("---")
+            .take(cols)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    let mut lines = vec![header, separator];
+    for row in grid.iter().skip(1) {
+        lines.push(make_row(row));
+    }
+    lines.join("\n")
 }
 
 /// 단이 HWP 원본 layout 에서 사용했을 높이를 LINE_SEG vpos 기준으로 추정 (px).

@@ -1677,7 +1677,6 @@ fn export_markdown(args: &[String]) {
     let assets_dir_name = format!("{}_assets", file_stem);
     let assets_dir_path = output_path.join(&assets_dir_name);
     let mut written_image_count: usize = 0;
-    let mut merged_pages: Vec<String> = Vec::new();
 
     let mime_to_ext = |mime: &str| -> &'static str {
         match mime {
@@ -1690,196 +1689,213 @@ fn export_markdown(args: &[String]) {
         }
     };
 
-    for page_num in &pages {
-        match doc.extract_page_markdown_with_images_native(*page_num) {
-            Ok((mut markdown, image_refs)) => {
-                for (img_idx, (sec_idx, para_idx, control_idx, bin_data_id)) in
-                    image_refs.iter().enumerate()
-                {
-                    let token = format!("[[RHWP_IMAGE:{}]]", img_idx + 1);
+    // 이미지 ref 목록을 순회해 `[[RHWP_IMAGE:n]]` 토큰을 실제 링크로 교체한다.
+    // page_label은 경고 메시지용 (페이지 번호 또는 "doc").
+    macro_rules! replace_image_tokens {
+        ($markdown:expr, $image_refs:expr, $page_label:expr, $img_offset:expr) => {{
+            'img_loop: for (img_idx, (sec_idx, para_idx, control_idx, bin_data_id)) in
+                $image_refs.iter().enumerate()
+            {
+                let global_idx = $img_offset + img_idx;
+                let token = format!("[[RHWP_IMAGE:{}]]", img_idx + 1);
 
-                    let try_control = match (sec_idx, para_idx, control_idx) {
-                        (Some(si), Some(pi), Some(ci)) => Some((*si, *pi, *ci)),
-                        _ => None,
-                    };
+                let try_control = match (sec_idx, para_idx, control_idx) {
+                    (Some(si), Some(pi), Some(ci)) => Some((*si, *pi, *ci)),
+                    _ => None,
+                };
 
-                    let (mime, image_data) = if let Some((si, pi, ci)) = try_control {
-                        match (
-                            doc.get_control_image_mime_native(si, pi, &[], ci),
-                            doc.get_control_image_data_native(si, pi, &[], ci),
-                        ) {
-                            (Ok(m), Ok(d)) => (m, d),
-                            _ => {
-                                if *bin_data_id == 0 {
+                let (mime, image_data) = if let Some((si, pi, ci)) = try_control {
+                    match (
+                        doc.get_control_image_mime_native(si, pi, &[], ci),
+                        doc.get_control_image_data_native(si, pi, &[], ci),
+                    ) {
+                        (Ok(m), Ok(d)) => (m, d),
+                        _ => {
+                            if *bin_data_id == 0 {
+                                eprintln!(
+                                    "경고: {} 이미지 추출 실패 (s{} p{} c{}), fallback bin_data_id 없음",
+                                    $page_label, si, pi, ci
+                                );
+                                $markdown = $markdown.replace(&token, "");
+                                continue 'img_loop;
+                            }
+                            let fb_mime = match doc.get_bin_data_image_mime_native(*bin_data_id) {
+                                Ok(m) => m,
+                                Err(e) => {
                                     eprintln!(
-                                        "경고: 페이지 {} 이미지 추출 실패 (s{} p{} c{}), fallback bin_data_id 없음",
-                                        page_num, si, pi, ci
+                                        "경고: {} 이미지 MIME fallback 실패 (bin={}): {:?}",
+                                        $page_label, bin_data_id, e
                                     );
-                                    markdown = markdown.replace(&token, "");
-                                    continue;
+                                    $markdown = $markdown.replace(&token, "");
+                                    continue 'img_loop;
                                 }
-                                let fb_mime = match doc.get_bin_data_image_mime_native(*bin_data_id)
-                                {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "경고: 페이지 {} 이미지 MIME fallback 실패 (bin={}): {:?}",
-                                            page_num, bin_data_id, e
-                                        );
-                                        markdown = markdown.replace(&token, "");
-                                        continue;
-                                    }
-                                };
-                                let fb_data = match doc.get_bin_data_image_data_native(*bin_data_id)
-                                {
-                                    Ok(d) => d,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "경고: 페이지 {} 이미지 데이터 fallback 실패 (bin={}): {:?}",
-                                            page_num, bin_data_id, e
-                                        );
-                                        markdown = markdown.replace(&token, "");
-                                        continue;
-                                    }
-                                };
-                                (fb_mime, fb_data)
-                            }
+                            };
+                            let fb_data = match doc.get_bin_data_image_data_native(*bin_data_id) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    eprintln!(
+                                        "경고: {} 이미지 데이터 fallback 실패 (bin={}): {:?}",
+                                        $page_label, bin_data_id, e
+                                    );
+                                    $markdown = $markdown.replace(&token, "");
+                                    continue 'img_loop;
+                                }
+                            };
+                            (fb_mime, fb_data)
                         }
-                    } else {
-                        if *bin_data_id == 0 {
+                    }
+                } else {
+                    if *bin_data_id == 0 {
+                        eprintln!(
+                            "경고: {} 이미지 추출 실패 (문서 좌표 없음, bin_data_id=0)",
+                            $page_label
+                        );
+                        $markdown = $markdown.replace(&token, "");
+                        continue 'img_loop;
+                    }
+                    let fb_mime = match doc.get_bin_data_image_mime_native(*bin_data_id) {
+                        Ok(m) => m,
+                        Err(e) => {
                             eprintln!(
-                                "경고: 페이지 {} 이미지 추출 실패 (문서 좌표 없음, bin_data_id=0)",
-                                page_num
+                                "경고: {} 이미지 MIME fallback 실패 (bin={}): {:?}",
+                                $page_label, bin_data_id, e
                             );
-                            markdown = markdown.replace(&token, "");
-                            continue;
+                            $markdown = $markdown.replace(&token, "");
+                            continue 'img_loop;
                         }
-                        let fb_mime = match doc.get_bin_data_image_mime_native(*bin_data_id) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                eprintln!(
-                                    "경고: 페이지 {} 이미지 MIME fallback 실패 (bin={}): {:?}",
-                                    page_num, bin_data_id, e
-                                );
-                                markdown = markdown.replace(&token, "");
-                                continue;
-                            }
-                        };
-                        let fb_data = match doc.get_bin_data_image_data_native(*bin_data_id) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                eprintln!(
-                                    "경고: 페이지 {} 이미지 데이터 fallback 실패 (bin={}): {:?}",
-                                    page_num, bin_data_id, e
-                                );
-                                markdown = markdown.replace(&token, "");
-                                continue;
-                            }
-                        };
-                        (fb_mime, fb_data)
                     };
-
-                    // BMP/octet-stream → PNG 변환 (마크다운 렌더러는 BMP 미지원)
-                    let detected_mime: String = if mime == "application/octet-stream" {
-                        if image_data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
-                            "image/png".to_string()
-                        } else if image_data.starts_with(&[0xFF, 0xD8, 0xFF]) {
-                            "image/jpeg".to_string()
-                        } else if image_data.starts_with(b"GIF8") {
-                            "image/gif".to_string()
-                        } else if image_data.starts_with(&[0x42, 0x4D]) {
-                            "image/bmp".to_string()
-                        } else {
-                            mime.clone()
+                    let fb_data = match doc.get_bin_data_image_data_native(*bin_data_id) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!(
+                                "경고: {} 이미지 데이터 fallback 실패 (bin={}): {:?}",
+                                $page_label, bin_data_id, e
+                            );
+                            $markdown = $markdown.replace(&token, "");
+                            continue 'img_loop;
                         }
+                    };
+                    (fb_mime, fb_data)
+                };
+
+                // BMP/octet-stream → PNG 변환 (마크다운 렌더러는 BMP 미지원)
+                let detected_mime: String = if mime == "application/octet-stream" {
+                    if image_data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+                        "image/png".to_string()
+                    } else if image_data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                        "image/jpeg".to_string()
+                    } else if image_data.starts_with(b"GIF8") {
+                        "image/gif".to_string()
+                    } else if image_data.starts_with(&[0x42, 0x4D]) {
+                        "image/bmp".to_string()
                     } else {
                         mime.clone()
-                    };
-                    let (mime, image_data): (String, Vec<u8>) = if detected_mime == "image/bmp" {
-                        use std::io::Cursor;
-                        let result = image::load(Cursor::new(&image_data), image::ImageFormat::Bmp)
+                    }
+                } else {
+                    mime.clone()
+                };
+                let (mime, image_data): (String, Vec<u8>) = if detected_mime == "image/bmp" {
+                    use std::io::Cursor;
+                    let result =
+                        image::load(Cursor::new(&image_data), image::ImageFormat::Bmp)
                             .ok()
                             .and_then(|img| {
                                 let mut buf: Vec<u8> = Vec::new();
-                                img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-                                    .ok()
-                                    .map(|_| buf)
+                                img.write_to(
+                                    &mut Cursor::new(&mut buf),
+                                    image::ImageFormat::Png,
+                                )
+                                .ok()
+                                .map(|_| buf)
                             });
-                        match result {
-                            Some(png) => ("image/png".to_string(), png),
-                            None => (detected_mime, image_data),
-                        }
-                    } else {
-                        (detected_mime, image_data)
-                    };
-
-                    let ext = mime_to_ext(&mime);
-                    let image_filename = format!(
-                        "{}_p{:03}_img{:03}.{}",
-                        file_stem,
-                        page_num + 1,
-                        img_idx + 1,
-                        ext
-                    );
-
-                    let image_link = if let Some(ref s3) = s3_cfg {
-                        // S3/MinIO 업로드
-                        let key = if s3.prefix.is_empty() {
-                            image_filename.clone()
-                        } else {
-                            format!("{}/{}", s3.prefix.trim_end_matches('/'), image_filename)
-                        };
-                        match s3_put(s3, &key, &image_data, &mime) {
-                            Ok(s3_url) => {
-                                eprintln!("  이미지 업로드: {}", s3_url);
-                                written_image_count += 1;
-                                format!("![image {}]({})", img_idx + 1, s3_url)
-                            }
-                            Err(e) => {
-                                eprintln!("경고: S3 업로드 실패 - {}: {}", image_filename, e);
-                                String::new()
-                            }
-                        }
-                    } else {
-                        // 로컬 저장
-                        if !assets_dir_path.exists() {
-                            if let Err(e) = fs::create_dir_all(&assets_dir_path) {
-                                eprintln!(
-                                    "오류: 이미지 출력 폴더 생성 실패 - {}: {}",
-                                    assets_dir_path.display(),
-                                    e
-                                );
-                                markdown = markdown.replace(&token, "");
-                                continue;
-                            }
-                        }
-                        let image_path = assets_dir_path.join(&image_filename);
-                        if let Err(e) = fs::write(&image_path, &image_data) {
-                            eprintln!("경고: 이미지 저장 실패 - {}: {}", image_path.display(), e);
-                            markdown = markdown.replace(&token, "");
-                            continue;
-                        }
-                        written_image_count += 1;
-                        format!("![image {}]({}/{})", img_idx + 1, assets_dir_name, image_filename)
-                    };
-
-                    markdown = markdown.replace(&token, &image_link);
-                }
-
-                if let Some(ref cfg) = llm_cfg {
-                    markdown = restructure_nested_tables(&markdown, cfg);
-                }
-
-                markdown = remove_page_numbers(&markdown);
-
-                let markdown = markdown.trim_end().to_string();
-
-                if do_merge {
-                    if !markdown.is_empty() {
-                        merged_pages.push(markdown);
+                    match result {
+                        Some(png) => ("image/png".to_string(), png),
+                        None => (detected_mime, image_data),
                     }
                 } else {
-                    let mut out = markdown;
+                    (detected_mime, image_data)
+                };
+
+                let ext = mime_to_ext(&mime);
+                let image_filename =
+                    format!("{}_img{:04}.{}", file_stem, global_idx + 1, ext);
+
+                let image_link = if let Some(ref s3) = s3_cfg {
+                    let key = if s3.prefix.is_empty() {
+                        image_filename.clone()
+                    } else {
+                        format!("{}/{}", s3.prefix.trim_end_matches('/'), image_filename)
+                    };
+                    match s3_put(s3, &key, &image_data, &mime) {
+                        Ok(s3_url) => {
+                            eprintln!("  이미지 업로드: {}", s3_url);
+                            written_image_count += 1;
+                            format!("![image {}]({})", global_idx + 1, s3_url)
+                        }
+                        Err(e) => {
+                            eprintln!("경고: S3 업로드 실패 - {}: {}", image_filename, e);
+                            String::new()
+                        }
+                    }
+                } else {
+                    if !assets_dir_path.exists() {
+                        if let Err(e) = fs::create_dir_all(&assets_dir_path) {
+                            eprintln!(
+                                "오류: 이미지 출력 폴더 생성 실패 - {}: {}",
+                                assets_dir_path.display(),
+                                e
+                            );
+                            $markdown = $markdown.replace(&token, "");
+                            continue 'img_loop;
+                        }
+                    }
+                    let image_path = assets_dir_path.join(&image_filename);
+                    if let Err(e) = fs::write(&image_path, &image_data) {
+                        eprintln!(
+                            "경고: 이미지 저장 실패 - {}: {}",
+                            image_path.display(),
+                            e
+                        );
+                        $markdown = $markdown.replace(&token, "");
+                        continue 'img_loop;
+                    }
+                    written_image_count += 1;
+                    format!(
+                        "![image {}]({}/{})",
+                        global_idx + 1,
+                        assets_dir_name,
+                        image_filename
+                    )
+                };
+
+                $markdown = $markdown.replace(&token, &image_link);
+            }
+        }};
+    }
+
+    if do_merge {
+        // 문서 전체를 페이지 경계 없이 한 번에 추출 → cross-page 표 중복 없음
+        let (mut markdown, image_refs) = doc.extract_document_markdown_with_images_native();
+        replace_image_tokens!(markdown, image_refs, "doc", 0);
+        if let Some(ref cfg) = llm_cfg {
+            markdown = restructure_nested_tables(&markdown, cfg);
+        }
+        let md_path = output_path.join(format!("{}.md", file_stem));
+        match fs::write(&md_path, markdown.as_bytes()) {
+            Ok(_) => println!("  → {} ({}페이지 병합)", md_path.display(), page_count),
+            Err(e) => eprintln!("오류: Markdown 저장 실패 - {}: {}", md_path.display(), e),
+        }
+    } else {
+        for page_num in &pages {
+            match doc.extract_page_markdown_with_images_native(*page_num) {
+                Ok((mut markdown, image_refs)) => {
+                    let page_label = format!("페이지 {}", page_num);
+                    replace_image_tokens!(markdown, image_refs, page_label, 0);
+                    if let Some(ref cfg) = llm_cfg {
+                        markdown = restructure_nested_tables(&markdown, cfg);
+                    }
+                    markdown = remove_page_numbers(&markdown);
+                    let mut out = markdown.trim_end().to_string();
                     if !out.ends_with('\n') {
                         out.push('\n');
                     }
@@ -1891,22 +1907,17 @@ fn export_markdown(args: &[String]) {
                     let md_path = output_path.join(&md_filename);
                     match fs::write(&md_path, out.as_bytes()) {
                         Ok(_) => println!("  → {}", md_path.display()),
-                        Err(e) => eprintln!("오류: Markdown 저장 실패 - {}: {}", md_path.display(), e),
+                        Err(e) => eprintln!(
+                            "오류: Markdown 저장 실패 - {}: {}",
+                            md_path.display(),
+                            e
+                        ),
                     }
                 }
+                Err(e) => {
+                    eprintln!("오류: 페이지 {} Markdown 생성 실패 - {:?}", page_num, e);
+                }
             }
-            Err(e) => {
-                eprintln!("오류: 페이지 {} Markdown 생성 실패 - {:?}", page_num, e);
-            }
-        }
-    }
-
-    if do_merge {
-        let merged = merged_pages.join("\n\n");
-        let md_path = output_path.join(format!("{}.md", file_stem));
-        match fs::write(&md_path, merged.as_bytes()) {
-            Ok(_) => println!("  → {} ({}페이지 병합)", md_path.display(), merged_pages.len()),
-            Err(e) => eprintln!("오류: Markdown 저장 실패 - {}: {}", md_path.display(), e),
         }
     }
 
